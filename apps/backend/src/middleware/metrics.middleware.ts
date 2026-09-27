@@ -385,6 +385,72 @@ export const probeAlertsTotal = createCounter(
   'Total number of probe alert threshold breaches, labelled by suite and location.',
 );
 
+// ── Sync worker / ledger event pipeline ──────────────────────────────────────
+
+/**
+ * Sync worker lag in ledgers between the local cursor and the chain tip.
+ * Labels: entity_type (booking|property|review|payment)
+ *
+ * A gauge value of 0 means fully caught up.  Use this to drive an alert
+ * when lag stays above a threshold for more than N minutes.
+ *
+ * Modelled as a counter that is reset on each scrape cycle by the scheduler
+ * (the scheduler calls setGauge() which zeroes and re-increments by the
+ * current lag value).
+ */
+export const syncLagLedgers = createCounter(
+  'sync_lag_ledgers',
+  'Current lag between the sync cursor and the chain tip in ledgers, labelled by entity_type.',
+);
+
+/**
+ * Total events written to the ledger event inbox.
+ * Labels: entity_type, written (true|false — false = duplicate skip)
+ */
+export const syncInboxEventsTotal = createCounter(
+  'sync_inbox_events_total',
+  'Total ledger events written to the inbox, labelled by entity_type and whether the write was a fresh insert.',
+);
+
+/**
+ * Total events in terminal states.
+ * Labels: entity_type, status (processed|failed|dead)
+ */
+export const syncInboxStatusTotal = createCounter(
+  'sync_inbox_status_total',
+  'Total ledger inbox events by terminal status, labelled by entity_type and status.',
+);
+
+/**
+ * Dead-letter queue depth — events promoted to dead status awaiting
+ * operator review.
+ * Labels: entity_type
+ *
+ * Alert when this is non-zero and not decreasing.
+ */
+export const syncDeadLetterDepth = createCounter(
+  'sync_dead_letter_depth',
+  'Current number of dead-lettered ledger events awaiting operator review, labelled by entity_type.',
+);
+
+/**
+ * Total events re-queued from failed → pending by the DLQ retry loop.
+ * Labels: entity_type
+ */
+export const syncRequeueTotal = createCounter(
+  'sync_requeue_total',
+  'Total ledger events re-queued from failed to pending by the retry loop, labelled by entity_type.',
+);
+
+/**
+ * Total cursor advances (successful projection batches).
+ * Labels: entity_type
+ */
+export const syncCursorAdvancesTotal = createCounter(
+  'sync_cursor_advances_total',
+  'Total cursor advance operations committed, labelled by entity_type.',
+);
+
 // ── Distributed tracing ────────────────────────────────────────────────────────
 
 /**

@@ -113,4 +113,18 @@ router.get('/audit-logs', requireScope('admin:audit:read'), getAuditLogsHandler)
 import { approveRefundHandler } from '@/controllers/admin.controller.js';
 router.post('/refunds/approve', requireScope('admin:refunds:approve'), approveRefundHandler);
 
+// ── Sync worker observability ──────────────────────────────────────────────────
+// Scope: admin:reconciliation:read → admin, finance
+// These endpoints are read-only except for the cursor reset which is also
+// gated on admin:reconciliation:read (operators with that scope can reset).
+import {
+  getSyncStatusHandler,
+  getDeadLetterEventsHandler,
+  resetCursorHandler,
+} from '@/controllers/adminSync.controller.js';
+
+router.get('/sync/status', requireScope('admin:reconciliation:read'), getSyncStatusHandler);
+router.get('/sync/dead-letter', requireScope('admin:reconciliation:read'), getDeadLetterEventsHandler);
+router.post('/sync/cursor/reset', requireScope('admin:reconciliation:read'), resetCursorHandler);
+
 export default router;
