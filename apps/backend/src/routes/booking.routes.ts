@@ -7,7 +7,6 @@ import {
   createBooking,
   declineModification,
   deleteBooking,
-  disputeBooking,
   getBooking,
   getBookingCalendar,
   getBookingReceipt,
@@ -87,17 +86,16 @@ router.post('/:id/confirm', authenticate, confirmBooking);
 router.post('/:id/complete', authenticate, completeBooking);
 
 // POST /api/v1/bookings/:id/dispute
-// Tenant raises a dispute → status: Disputed (escrow held)
-// Body: { reason?: string }
-router.post('/:id/dispute', authenticate, disputeBooking);
+// Tenant or host raises a dispute → status: Disputed (escrow held)
+// Body: { reason: string (min 10), details?: string }
+// The legacy `disputeBooking` handler has been removed — `raiseDispute` is
+// the canonical path and includes body validation via raiseDisputeSchema.
+router.post('/:id/dispute', authenticate, validateBody(raiseDisputeSchema), raiseDispute);
 
 // POST /api/v1/bookings/:id/cancel
 // Tenant cancels a booking → refund computed per policy → escrow settled → both parties notified
 // Body (optional): { reason?: string }
 router.post('/:id/cancel', authenticate, validateBody(cancelBookingSchema), cancelBooking);
-
-// POST /api/v1/bookings/:id/dispute
-router.post('/:id/dispute', authenticate, validateBody(raiseDisputeSchema), raiseDispute);
 
 // POST /api/v1/bookings/:id/dispute/resolve
 router.post('/:id/dispute/resolve', authenticate, validateBody(resolveDisputeSchema), resolveDispute);

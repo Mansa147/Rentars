@@ -40,7 +40,9 @@ export type AdminScope =
   | 'admin:bookings:read'
   // Dispute management
   | 'admin:disputes:read'
-  | 'admin:disputes:resolve'   // HIGH-RISK: financial settlement
+  | 'admin:disputes:claim'     // claim / unclaim a dispute case for review
+  | 'admin:disputes:escalate'  // escalate a case to a senior admin
+  | 'admin:disputes:resolve'   // HIGH-RISK: financial settlement, dual-approval required
   // Audit logs
   | 'admin:audit:read'
   // Rate limits
@@ -74,6 +76,8 @@ export const ROLE_SCOPES: Record<AdminRole, AdminScope[]> = {
     'admin:properties:feature',
     'admin:bookings:read',
     'admin:disputes:read',
+    'admin:disputes:claim',
+    'admin:disputes:escalate',
     'admin:disputes:resolve',
     'admin:audit:read',
     'admin:ratelimits:read',
@@ -90,6 +94,8 @@ export const ROLE_SCOPES: Record<AdminRole, AdminScope[]> = {
     'admin:properties:feature',
     'admin:bookings:read',
     'admin:disputes:read',
+    'admin:disputes:claim',
+    'admin:disputes:escalate',
     'admin:disputes:resolve',
     'admin:audit:read',
   ],

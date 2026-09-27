@@ -22,6 +22,7 @@ import {
 import { enqueueOp } from '@/services/blockchainDegradedMode.service.js';
 import { loggingService } from './logging.service.js';
 import { createNotification, getPreferences } from './notification.service.js';
+import { auditLogger } from './auditLogger.service.js';
 import { emailService } from './email.service.js';
 import { buildPreferenceUrlForUser } from './preferenceToken.js';
 import { computeRefund } from './refundPolicy.service.js';
@@ -1495,7 +1496,10 @@ export class BookingService {
       'Disputed',
       userId,
       reason,
-      { dispute_status: 'raised' },
+      {
+        dispute_status:  'raised',
+        ...(details ? { dispute_details: details } : {}),
+      },
     );
     if (!transitionResult.success) return transitionResult;
 
@@ -1518,6 +1522,14 @@ export class BookingService {
     }
 
     loggingService.logBlockchainOperation('raiseDispute', { bookingId, userId, reason });
+
+    await auditLogger.log({
+      actorId:      userId,
+      action:       'dispute.open',
+      resourceType: 'dispute',
+      resourceId:   bookingId,
+      meta:         { reason, has_details: !!details },
+    });
 
     return { success: true, data: transitionResult.data! };
   }

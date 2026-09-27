@@ -477,78 +477,13 @@ export async function listAdminBookings(req: AdminRequest, res: Response): Promi
 }
 
 // ─── Dispute management ───────────────────────────────────────────────────────
-
-const resolveDisputeSchema = z.object({
-  resolution_note: z.string().min(1, 'resolution_note is required').max(2000),
-  outcome: z.enum(['refund_tenant', 'release_to_host', 'split']).optional(),
-});
-
-/**
- * GET /api/v1/admin/disputes
- * List open disputes.
- */
-export async function listDisputes(req: AdminRequest, res: Response): Promise<void> {
-  const page = Math.max(1, Number(req.query.page ?? 1));
-  const limit = Math.min(100, Math.max(1, Number(req.query.limit ?? 20)));
-  const offset = (page - 1) * limit;
-
-  const { data, error, count } = await supabase
-    .from('bookings')
-    .select('id, property_id, user_id, status, check_in, check_out, total_price, created_at', { count: 'exact' })
-    .eq('status', 'disputed')
-    .order('created_at', { ascending: false })
-    .range(offset, offset + limit - 1);
-
-  if (error) {
-    res.status(500).json({ error: { code: 'DB_ERROR', message: error.message } });
-    return;
-  }
-
-  res.json({ data, meta: { page, limit, total: count ?? 0 } });
-}
-
-/**
- * POST /api/v1/admin/disputes/:id/resolve
- * Resolve a dispute with a resolution note.
- */
-export async function resolveDispute(req: AdminRequest, res: Response): Promise<void> {
-  const { id } = req.params;
-
-  const parsed = resolveDisputeSchema.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json({ error: { code: 'VALIDATION_ERROR', details: parsed.error.flatten().fieldErrors } });
-    return;
-  }
-
-  const { resolution_note, outcome } = parsed.data;
-
-  const { error } = await supabase
-    .from('bookings')
-    .update({
-      status: 'dispute_resolved',
-      dispute_resolution_note: resolution_note,
-      dispute_resolved_at: new Date().toISOString(),
-      dispute_outcome: outcome ?? null,
-    })
-    .eq('id', id)
-    .eq('status', 'disputed');
-
-  if (error) {
-    res.status(500).json({ error: { code: 'DB_ERROR', message: error.message } });
-    return;
-  }
-
-  await auditLogger.log({
-    actorId: req.adminId,
-    action: 'dispute.resolve',
-    resourceType: 'dispute',
-    resourceId: id,
-    ip: req.ip,
-    meta: { resolution_note, outcome },
-  });
-
-  res.json({ message: 'Dispute resolved.', resolution_note, outcome });
-}
+// All dispute handlers live in adminDispute.controller.ts and are imported by
+// admin.routes.ts directly. The stubs below have been removed — the new
+// controller provides: listDisputeQueue_handler, getDisputeCase_handler,
+// claimDispute_handler, unclaimDispute_handler, escalateDispute_handler,
+// resolveDispute_handler.
+//
+// This comment block is kept so git history shows the intentional replacement.
 
 // ─── Dashboard ────────────────────────────────────────────────────────────────
 
@@ -570,7 +505,7 @@ export async function getDashboard(req: AdminRequest, res: Response): Promise<vo
       supabase
         .from('bookings')
         .select('id', { count: 'exact', head: true })
-        .eq('status', 'disputed'),
+        .eq('status', 'Disputed'),
       supabase
         .from('audit_logs')
         .select('id, timestamp, actor_id, action, resource_type, resource_id, ip')
@@ -663,7 +598,7 @@ export async function approveRefundHandler(req: AdminRequest, res: Response): Pr
     return;
   }
 
-  const allowedStatuses = ['Confirmed', 'Completed', 'Disputed', 'dispute_resolved'];
+  const allowedStatuses = ['Confirmed', 'Completed', 'Disputed', 'Cancelled'];
   if (!allowedStatuses.includes((booking as { status: string }).status)) {
     res.status(422).json({
       error: {
