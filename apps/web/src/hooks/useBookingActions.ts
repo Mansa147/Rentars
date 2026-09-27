@@ -15,6 +15,18 @@ function authHeaders(): HeadersInit {
 
 type ActionType = 'confirm' | 'complete' | 'cancel' | 'dispute';
 
+/**
+ * Optional evidence payload attached to a dispute submission.
+ * `details` maps to the backend `raiseDisputeSchema.details` field (max 5 000 chars).
+ * Additional key-value pairs are stored as unstructured metadata.
+ */
+export interface DisputeEvidenceMetadata {
+  /** Extended description / supporting context (max 5 000 chars). */
+  details?: string;
+  /** Any extra key-value pairs (file references, timestamps, etc.) */
+  [key: string]: unknown;
+}
+
 interface UseBookingActionsResult {
   /** Currently executing action (or null) */
   pendingAction: ActionType | null;
@@ -26,8 +38,13 @@ interface UseBookingActionsResult {
   complete: () => Promise<Booking | null>;
   /** Cancel — transitions Pending|Confirmed → Cancelled */
   cancel: () => Promise<Booking | null>;
-  /** Dispute — transitions Confirmed → Disputed */
-  dispute: (reason?: string) => Promise<Booking | null>;
+  /**
+   * Dispute — transitions Confirmed → Disputed.
+   *
+   * @param reason   - Required: a plain-text reason (min 10 chars, max 2 000 chars).
+   * @param evidence - Optional: extended details and metadata stored with the dispute.
+   */
+  dispute: (reason: string, evidence?: DisputeEvidenceMetadata) => Promise<Booking | null>;
   clearError: () => void;
 }
 
@@ -79,11 +96,22 @@ export function useBookingActions(
     [bookingId, onSuccess],
   );
 
-  const confirm  = useCallback(() => call('confirm'),            [call]);
-  const complete = useCallback(() => call('complete'),           [call]);
-  const cancel   = useCallback(() => call('cancel'),             [call]);
-  const dispute  = useCallback(
-    (reason?: string) => call('dispute', reason ? { reason } : undefined),
+  const confirm  = useCallback(() => call('confirm'),  [call]);
+  const complete = useCallback(() => call('complete'), [call]);
+  const cancel   = useCallback(() => call('cancel'),   [call]);
+
+  const dispute = useCallback(
+    (reason: string, evidence?: DisputeEvidenceMetadata) => {
+      const body: Record<string, unknown> = { reason };
+      if (evidence?.details) body.details = evidence.details;
+      // Spread any extra metadata fields onto the body
+      if (evidence) {
+        for (const [k, v] of Object.entries(evidence)) {
+          if (k !== 'details') body[k] = v;
+        }
+      }
+      return call('dispute', body);
+    },
     [call],
   );
 

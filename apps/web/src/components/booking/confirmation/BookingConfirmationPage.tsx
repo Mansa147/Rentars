@@ -5,7 +5,9 @@ import { useBookingDetails } from '@/hooks/useBookingDetails';
 import { useEscrowStatus } from '@/hooks/useEscrowStatus';
 import EscrowStatusCard from './EscrowStatusCard';
 import AddToCalendar from './AddToCalendar';
+import BookingLifecycleActions from '@/components/booking/BookingLifecycleActions';
 import { Mail, Phone, Download } from 'lucide-react';
+import type { Booking } from '@/types/booking';
 import type { Property } from '@/types/property';
 
 interface BookingConfirmationPageProps {
@@ -75,10 +77,23 @@ function useReceiptDownload() {
 export default function BookingConfirmationPage({
   bookingId,
 }: BookingConfirmationPageProps) {
-  const { booking, isLoading } = useBookingDetails(bookingId);
+  const { booking: initialBooking, isLoading } = useBookingDetails(bookingId);
   const { escrow } = useEscrowStatus(bookingId);
-  const property = usePropertyDetails(booking?.property_id);
   const { downloadReceipt, downloading } = useReceiptDownload();
+
+  // Local booking state: allows lifecycle actions (confirm, dispute, cancel,
+  // complete) to update the displayed status without a full page reload.
+  const [booking, setBooking] = useState<Booking | null>(null);
+
+  // Sync from the fetch result once available, but don't overwrite a
+  // locally-updated booking (e.g. after a dispute is raised).
+  useEffect(() => {
+    if (initialBooking && !booking) {
+      setBooking(initialBooking as Booking);
+    }
+  }, [initialBooking, booking]);
+
+  const property = usePropertyDetails(booking?.property_id);
 
   if (isLoading) {
     return <div className="text-center py-8">Loading booking details...</div>;
@@ -138,17 +153,32 @@ export default function BookingConfirmationPage({
           </div>
         </div>
 
+        {/* Status */}
         <div className="border-t border-gray-200 dark:border-gray-700 pt-4 mb-4">
           <p className="text-sm text-gray-600 dark:text-gray-400 mb-2">Status</p>
           <span
             className={`inline-block px-3 py-1 rounded-full text-sm font-medium ${
-              booking.status === 'confirmed'
+              booking.status === 'confirmed' || booking.status === 'Confirmed'
                 ? 'bg-green-100 dark:bg-green-900 text-green-700 dark:text-green-300'
+                : booking.status === 'disputed' || booking.status === 'Disputed'
+                ? 'bg-amber-100 dark:bg-amber-900 text-amber-700 dark:text-amber-300'
+                : booking.status === 'cancelled' || booking.status === 'Cancelled'
+                ? 'bg-red-100 dark:bg-red-900 text-red-700 dark:text-red-300'
+                : booking.status === 'completed' || booking.status === 'Completed'
+                ? 'bg-blue-100 dark:bg-blue-900 text-blue-700 dark:text-blue-300'
                 : 'bg-yellow-100 dark:bg-yellow-900 text-yellow-700 dark:text-yellow-300'
             }`}
           >
             {booking.status.charAt(0).toUpperCase() + booking.status.slice(1)}
           </span>
+        </div>
+
+        {/* Lifecycle actions — dispute, cancel, complete, confirm */}
+        <div className="border-t border-gray-200 dark:border-gray-700 pt-4 mb-4">
+          <BookingLifecycleActions
+            booking={booking}
+            onBookingUpdated={setBooking}
+          />
         </div>
 
         {/* Add to Calendar */}
@@ -184,6 +214,22 @@ export default function BookingConfirmationPage({
             <span className="text-gray-600 dark:text-gray-400">+1 (555) 000-0000</span>
           </div>
         </div>
+      </div>
+
+      {/* Receipt download */}
+      <div className="flex justify-end">
+        <button
+          type="button"
+          onClick={() => downloadReceipt(bookingId)}
+          disabled={downloading}
+          className="inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-gray-300
+            dark:border-gray-600 text-sm text-gray-700 dark:text-gray-300
+            hover:bg-gray-100 dark:hover:bg-gray-800 disabled:opacity-50 transition
+            focus:outline-none focus-visible:ring-2 focus-visible:ring-gray-400"
+        >
+          <Download size={15} aria-hidden="true" />
+          {downloading ? 'Downloading…' : 'Download receipt'}
+        </button>
       </div>
     </div>
   );
