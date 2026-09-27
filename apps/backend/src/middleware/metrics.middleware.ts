@@ -387,6 +387,75 @@ export const probeAlertsTotal = createCounter(
 
 // ── Sync worker / ledger event pipeline ──────────────────────────────────────
 
+// ── Circuit breaker / degraded mode ──────────────────────────────────────────
+
+/**
+ * Total number of times a circuit breaker tripped to OPEN state.
+ * Labels: dependency (soroban-rpc|trustlesswork-api)
+ */
+export const circuitBreakerOpenTotal = createCounter(
+  'circuit_breaker_open_total',
+  'Total number of circuit breaker OPEN transitions, labelled by dependency.',
+);
+
+/**
+ * Total number of calls rejected by an OPEN circuit breaker (fast-fail).
+ * Labels: dependency (soroban-rpc|trustlesswork-api)
+ */
+export const circuitBreakerRejectedTotal = createCounter(
+  'circuit_breaker_rejected_total',
+  'Total number of calls fast-failed by an open circuit breaker, labelled by dependency.',
+);
+
+/**
+ * Total number of times a circuit breaker recovered to CLOSED.
+ * Labels: dependency (soroban-rpc|trustlesswork-api)
+ */
+export const circuitBreakerRecoveryTotal = createCounter(
+  'circuit_breaker_recovery_total',
+  'Total number of circuit breaker CLOSED (recovered) transitions, labelled by dependency.',
+);
+
+/**
+ * Current depth of the blockchain pending-ops queue (operations deferred
+ * during an outage, waiting for recovery drain).
+ * No labels — the whole queue is a single observable value.
+ */
+export const blockchainPendingOpsDepth = createCounter(
+  'blockchain_pending_ops_depth',
+  'Current number of on-chain operations queued for deferred drain after recovery.',
+);
+
+/**
+ * Total on-chain operations successfully drained after recovery.
+ * Labels: op_type (create_booking_on_chain|cancel_booking_on_chain|
+ *                  update_booking_status_on_chain|release_escrow|cancel_escrow)
+ */
+export const blockchainOpsDrainedTotal = createCounter(
+  'blockchain_ops_drained_total',
+  'Total deferred on-chain operations successfully executed after recovery, labelled by op_type.',
+);
+
+/**
+ * Total on-chain operations that exhausted drain retries and were marked failed.
+ * Labels: op_type
+ */
+export const blockchainOpsFailedTotal = createCounter(
+  'blockchain_ops_failed_total',
+  'Total deferred on-chain operations that exhausted drain retries, labelled by op_type.',
+);
+
+/**
+ * Total booking creation attempts that were served in degraded mode
+ * (escrow creation deferred because TrustlessWork was unavailable).
+ */
+export const bookingsDegradedTotal = createCounter(
+  'bookings_degraded_total',
+  'Total booking creations that returned a degraded response due to chain unavailability.',
+);
+
+// ── Sync worker lag ───────────────────────────────────────────────────────────
+
 /**
  * Sync worker lag in ledgers between the local cursor and the chain tip.
  * Labels: entity_type (booking|property|review|payment)

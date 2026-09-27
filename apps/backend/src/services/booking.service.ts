@@ -14,6 +14,12 @@ import {
   updateBookingStatusOnChain,
 } from '@/blockchain/bookingContract.js';
 import { trustlessWorkClient } from '@/blockchain/trustlessWork.js';
+import { CircuitOpenError } from '@/services/chainCircuitBreaker.service.js';
+import {
+  isTrustlessWorkDegraded,
+  isSorobanDegraded,
+} from '@/services/chainCircuitBreaker.service.js';
+import { enqueueOp } from '@/services/blockchainDegradedMode.service.js';
 import { loggingService } from './logging.service.js';
 import { createNotification, getPreferences } from './notification.service.js';
 import { emailService } from './email.service.js';
@@ -26,6 +32,7 @@ import {
   incCounter,
   bookingsCreatedTotal,
   escrowFailuresTotal,
+  bookingsDegradedTotal,
 } from '@/middleware/metrics.middleware.js';
 import { checkDateRangeAvailability } from './availability.service.js';
 import { calculateRangePrice } from './pricing.service.js';
@@ -646,6 +653,21 @@ export class BookingService {
     }
 
     // 6. Create TrustlessWork escrow (after local reservation succeeds).
+    //    If the TrustlessWork circuit breaker is OPEN we return a truthful
+    //    degraded error rather than creating a booking that can never be paid.
+    //    The DB reservation is rolled back so the slot is freed for retry.
+    if (isTrustlessWorkDegraded()) {
+      await supabase.from('bookings').delete().eq('id', bookingId);
+      incCounter(bookingsDegradedTotal, {});
+      return {
+        success: false,
+        error:
+          'Payment infrastructure is temporarily unavailable. No charge has been made. Please try again in a few minutes.',
+        // biome-ignore lint/suspicious/noExplicitAny: extended error shape for frontend
+        ...(({ degraded: true, retryable: true }) as any),
+      };
+    }
+
     let escrowId: string | undefined;
 
     loggingService.logBlockchainOperation('createEscrow', {
@@ -680,6 +702,18 @@ export class BookingService {
       incCounter(escrowFailuresTotal, { operation: 'create_escrow' });
       // Roll back the DB reservation so the slot is freed
       await supabase.from('bookings').delete().eq('id', bookingId);
+
+      // Distinguish a circuit-open failure from a real API error so the
+      // frontend can show a more helpful message.
+      if (err instanceof CircuitOpenError) {
+        incCounter(bookingsDegradedTotal, {});
+        return {
+          success: false,
+          error:
+            'Payment infrastructure is temporarily unavailable. No charge has been made. Please try again in a few minutes.',
+        };
+      }
+
       return {
         success: false,
         error: `Failed to create escrow: ${String(err)}`,
@@ -735,7 +769,9 @@ export class BookingService {
       console.warn('[BookingService] Confirmation email dispatch failed:', err),
     );
 
-    // 8. Create on-chain booking record (non-fatal on failure).
+    // 8. Create on-chain booking record.
+    //    When Soroban is degraded, enqueue for recovery drain instead of
+    //    silently skipping so the on-chain record is eventually created.
     if (prop.on_chain_id !== undefined && prop.on_chain_id !== null) {
       const checkInTs = BigInt(Math.floor(checkInDate.getTime() / 1000));
       const checkOutTs = BigInt(Math.floor(checkOutDate.getTime() / 1000));
@@ -746,36 +782,67 @@ export class BookingService {
         userId: tenant_id,
       });
 
-      try {
-        const onChainId = await this.blockchain.createBookingOnChain(
-          BigInt(prop.on_chain_id),
-          buyerStellarAddress,
-          checkInTs,
-          checkOutTs,
-          BigInt(Math.round(total_price * 1e7)),
+      if (isSorobanDegraded()) {
+        // Soroban RPC is OPEN — defer the on-chain write.
+        await enqueueOp({
+          booking_id: booking.id,
+          op_type: 'create_booking_on_chain',
+          payload: {
+            on_chain_property_id: String(prop.on_chain_id),
+            buyer_stellar_address: buyerStellarAddress,
+            check_in_ts: String(checkInTs),
+            check_out_ts: String(checkOutTs),
+            total_price_stroops: String(BigInt(Math.round(total_price * 1e7))),
+          },
+        }).catch((e: unknown) =>
+          console.warn('[BookingService] Failed to enqueue deferred on-chain creation:', e),
         );
+      } else {
+        try {
+          const onChainId = await this.blockchain.createBookingOnChain(
+            BigInt(prop.on_chain_id),
+            buyerStellarAddress,
+            checkInTs,
+            checkOutTs,
+            BigInt(Math.round(total_price * 1e7)),
+          );
 
-        loggingService.logBlockchainOperation('createBookingOnChain', {
-          bookingId: booking.id,
-          propertyId: property_id,
-          userId: tenant_id,
-          onChainId: String(onChainId),
-        });
+          loggingService.logBlockchainOperation('createBookingOnChain', {
+            bookingId: booking.id,
+            propertyId: property_id,
+            userId: tenant_id,
+            onChainId: String(onChainId),
+          });
 
-        await supabase
-          .from('bookings')
-          .update({ on_chain_id: Number(onChainId) })
-          .eq('id', booking.id);
+          await supabase
+            .from('bookings')
+            .update({ on_chain_id: Number(onChainId) })
+            .eq('id', booking.id);
 
-        booking.on_chain_id = Number(onChainId);
-      } catch (err) {
-        loggingService.logBlockchainOperation(
-          'createBookingOnChain',
-          { bookingId: booking.id, propertyId: property_id, userId: tenant_id },
-          undefined,
-          String(err),
-        );
-        console.warn('[BookingService] On-chain booking creation failed:', err);
+          booking.on_chain_id = Number(onChainId);
+        } catch (err) {
+          loggingService.logBlockchainOperation(
+            'createBookingOnChain',
+            { bookingId: booking.id, propertyId: property_id, userId: tenant_id },
+            undefined,
+            String(err),
+          );
+          // Enqueue for recovery drain so the record is eventually created.
+          await enqueueOp({
+            booking_id: booking.id,
+            op_type: 'create_booking_on_chain',
+            payload: {
+              on_chain_property_id: String(prop.on_chain_id),
+              buyer_stellar_address: buyerStellarAddress,
+              check_in_ts: String(checkInTs),
+              check_out_ts: String(checkOutTs),
+              total_price_stroops: String(BigInt(Math.round(total_price * 1e7))),
+            },
+          }).catch((e: unknown) =>
+            console.warn('[BookingService] Failed to enqueue deferred on-chain creation:', e),
+          );
+          console.warn('[BookingService] On-chain booking creation failed — deferred:', err);
+        }
       }
     }
 
@@ -883,6 +950,17 @@ export class BookingService {
         refundAmount: refund.refundAmount,
       });
 
+      // If TrustlessWork is degraded, block the cancellation — we must not
+      // mark the DB cancelled without settling the escrow first, as that would
+      // strand funds permanently.
+      if (isTrustlessWorkDegraded()) {
+        return {
+          success: false,
+          error:
+            'Payment infrastructure is temporarily unavailable. Your booking has not been cancelled. Please try again in a few minutes.',
+        };
+      }
+
       try {
         if (refund.tier === 'full') {
           // Full refund: return the entire escrow to the tenant.
@@ -903,6 +981,13 @@ export class BookingService {
           undefined,
           String(err),
         );
+        if (err instanceof CircuitOpenError) {
+          return {
+            success: false,
+            error:
+              'Payment infrastructure is temporarily unavailable. Your booking has not been cancelled. Please try again in a few minutes.',
+          };
+        }
         return {
           success: false,
           error: `Failed to settle escrow: ${String(err)}`,
@@ -944,7 +1029,7 @@ export class BookingService {
       createNotification(hostId, 'booking_cancelled', notificationData).catch(() => {});
     }
 
-    // 8. Update on-chain status (non-fatal)
+    // 8. Update on-chain status — queue for drain if Soroban is degraded
     if (booking.on_chain_id !== undefined && booking.on_chain_id !== null) {
       const callerAddress = await fetchStellarAddress(userId);
 
@@ -954,19 +1039,33 @@ export class BookingService {
           userId,
         });
 
-        try {
-          await this.blockchain.cancelBookingOnChain(BigInt(booking.on_chain_id), callerAddress);
-        } catch (err) {
-          loggingService.logBlockchainOperation(
-            'cancelBookingOnChain',
-            {
-              bookingId,
-              userId,
-            },
-            undefined,
-            String(err),
+        if (isSorobanDegraded()) {
+          await enqueueOp({
+            booking_id: bookingId,
+            op_type: 'cancel_booking_on_chain',
+            payload: { on_chain_id: String(booking.on_chain_id), caller_address: callerAddress },
+          }).catch((e: unknown) =>
+            console.warn('[BookingService] Failed to enqueue deferred on-chain cancel:', e),
           );
-          console.warn('[BookingService] On-chain cancellation failed:', err);
+        } else {
+          try {
+            await this.blockchain.cancelBookingOnChain(BigInt(booking.on_chain_id), callerAddress);
+          } catch (err) {
+            loggingService.logBlockchainOperation(
+              'cancelBookingOnChain',
+              { bookingId, userId },
+              undefined,
+              String(err),
+            );
+            await enqueueOp({
+              booking_id: bookingId,
+              op_type: 'cancel_booking_on_chain',
+              payload: { on_chain_id: String(booking.on_chain_id), caller_address: callerAddress },
+            }).catch((e: unknown) =>
+              console.warn('[BookingService] Failed to enqueue deferred on-chain cancel:', e),
+            );
+            console.warn('[BookingService] On-chain cancellation deferred:', err);
+          }
         }
       }
     }
@@ -1015,6 +1114,14 @@ export class BookingService {
         escrowId: booking.escrow_id,
       });
 
+      if (isTrustlessWorkDegraded()) {
+        return {
+          success: false,
+          error:
+            'Payment infrastructure is temporarily unavailable. The booking cannot be confirmed right now. Please try again in a few minutes.',
+        };
+      }
+
       try {
         await trustlessWorkClient.releaseEscrow(booking.escrow_id, 'Booking confirmed by host');
       } catch (err) {
@@ -1024,6 +1131,13 @@ export class BookingService {
           undefined,
           String(err),
         );
+        if (err instanceof CircuitOpenError) {
+          return {
+            success: false,
+            error:
+              'Payment infrastructure is temporarily unavailable. The booking cannot be confirmed right now. Please try again in a few minutes.',
+          };
+        }
         return { success: false, error: `Failed to release escrow: ${String(err)}` };
       }
     }
@@ -1044,27 +1158,44 @@ export class BookingService {
       );
     }
 
-    // Update on-chain status (non-fatal)
+    // Update on-chain status — queue for drain if Soroban is degraded
     if (booking.on_chain_id !== undefined && booking.on_chain_id !== null) {
       const callerAddress = await fetchStellarAddress(userId);
 
       if (callerAddress) {
         loggingService.logBlockchainOperation('updateBookingStatusOnChain', { bookingId, userId });
 
-        try {
-          await this.blockchain.updateBookingStatusOnChain(
-            BigInt(booking.on_chain_id),
-            'Confirmed',
-            callerAddress,
+        if (isSorobanDegraded()) {
+          await enqueueOp({
+            booking_id: bookingId,
+            op_type: 'update_booking_status_on_chain',
+            payload: { on_chain_id: String(booking.on_chain_id), new_status: 'Confirmed', caller_address: callerAddress },
+          }).catch((e: unknown) =>
+            console.warn('[BookingService] Failed to enqueue deferred status update:', e),
           );
-        } catch (err) {
-          loggingService.logBlockchainOperation(
-            'updateBookingStatusOnChain',
-            { bookingId, userId },
-            undefined,
-            String(err),
-          );
-          console.warn('[BookingService] On-chain status update failed:', err);
+        } else {
+          try {
+            await this.blockchain.updateBookingStatusOnChain(
+              BigInt(booking.on_chain_id),
+              'Confirmed',
+              callerAddress,
+            );
+          } catch (err) {
+            loggingService.logBlockchainOperation(
+              'updateBookingStatusOnChain',
+              { bookingId, userId },
+              undefined,
+              String(err),
+            );
+            await enqueueOp({
+              booking_id: bookingId,
+              op_type: 'update_booking_status_on_chain',
+              payload: { on_chain_id: String(booking.on_chain_id), new_status: 'Confirmed', caller_address: callerAddress },
+            }).catch((e: unknown) =>
+              console.warn('[BookingService] Failed to enqueue deferred status update:', e),
+            );
+            console.warn('[BookingService] On-chain status update deferred:', err);
+          }
         }
       }
     }

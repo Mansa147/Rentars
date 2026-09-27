@@ -5,6 +5,18 @@ import {
   getBookingWithEscrow,
 } from './bookingContract.js';
 import { EscrowError } from './errors.js';
+import {
+  trustlessWorkBreaker,
+  CircuitOpenError,
+} from '@/services/chainCircuitBreaker.service.js';
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+/**
+ * Hard per-request timeout for all TrustlessWork REST calls.
+ * Prevents a hung upstream from blocking the Node.js event loop indefinitely.
+ */
+const REQUEST_TIMEOUT_MS = 15_000;
 
 // ─── Interfaces ───────────────────────────────────────────────────────────────
 
@@ -67,35 +79,64 @@ export class TrustlessWorkClient {
     this.apiKey = apiKey;
   }
 
+  /**
+   * Core HTTP request method — wrapped in:
+   *   1. A per-request AbortController timeout (REQUEST_TIMEOUT_MS).
+   *   2. The trustlessWorkBreaker circuit breaker.
+   *
+   * Throws CircuitOpenError when the breaker is OPEN (fast-fail, no network call).
+   * Throws EscrowError on non-2xx responses.
+   */
   private async request<T>(
     method: string,
     path: string,
     body?: unknown,
   ): Promise<T> {
     const url = `${this.baseUrl}${path}`;
-    const response = await fetch(url, {
-      method,
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${this.apiKey}`,
-      },
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-    });
 
-    if (!response.ok) {
-      let message = `TrustlessWork API error: ${response.status} ${response.statusText}`;
+    return trustlessWorkBreaker.execute(async () => {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
       try {
-        const errorBody = (await response.json()) as { message?: string };
-        if (errorBody.message) {
-          message = errorBody.message;
-        }
-      } catch {
-        // ignore JSON parse errors on error responses
-      }
-      throw new EscrowError(message, response.status);
-    }
+        const response = await fetch(url, {
+          method,
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${this.apiKey}`,
+          },
+          body: body !== undefined ? JSON.stringify(body) : undefined,
+          signal: controller.signal,
+        });
 
-    return response.json() as Promise<T>;
+        if (!response.ok) {
+          let message = `TrustlessWork API error: ${response.status} ${response.statusText}`;
+          try {
+            const errorBody = (await response.json()) as { message?: string };
+            if (errorBody.message) {
+              message = errorBody.message;
+            }
+          } catch {
+            // ignore JSON parse errors on error responses
+          }
+          throw new EscrowError(message, response.status);
+        }
+
+        return response.json() as Promise<T>;
+      } catch (err) {
+        if (err instanceof EscrowError) throw err;
+        // AbortError from timeout, network errors, etc.
+        const isTimeout = (err as Error).name === 'AbortError';
+        throw new EscrowError(
+          isTimeout
+            ? `TrustlessWork request timed out after ${REQUEST_TIMEOUT_MS}ms`
+            : `TrustlessWork network error: ${(err as Error).message}`,
+          isTimeout ? 408 : 503,
+        );
+      } finally {
+        clearTimeout(timeoutId);
+      }
+    });
   }
 
   /**
@@ -103,6 +144,7 @@ export class TrustlessWorkClient {
    *
    * @param params - Escrow creation parameters
    * @returns CreateEscrowResponse containing escrowId, contractId, and status
+   * @throws CircuitOpenError when the TrustlessWork breaker is OPEN
    * @throws EscrowError on non-2xx API responses
    */
   async createEscrow(params: CreateEscrowRequest): Promise<CreateEscrowResponse> {
@@ -115,6 +157,7 @@ export class TrustlessWorkClient {
    * @param escrowId - ID of the escrow to fund
    * @param amount - USDC amount string
    * @param txHash - On-chain transaction hash of the funding transfer
+   * @throws CircuitOpenError when the TrustlessWork breaker is OPEN
    * @throws EscrowError on non-2xx API responses
    */
   async fundEscrow(escrowId: string, amount: string, txHash: string): Promise<void> {
@@ -127,6 +170,7 @@ export class TrustlessWorkClient {
    *
    * @param escrowId - ID of the escrow to release
    * @param reason - Human-readable reason for the release
+   * @throws CircuitOpenError when the TrustlessWork breaker is OPEN
    * @throws EscrowError on non-2xx API responses
    */
   async releaseEscrow(escrowId: string, reason: string): Promise<void> {
@@ -138,6 +182,7 @@ export class TrustlessWorkClient {
    * Cancel the escrow and return funds to the buyer (tenant).
    *
    * @param escrowId - ID of the escrow to cancel
+   * @throws CircuitOpenError when the TrustlessWork breaker is OPEN
    * @throws EscrowError on non-2xx API responses
    */
   async cancelEscrow(escrowId: string): Promise<void> {
@@ -149,6 +194,7 @@ export class TrustlessWorkClient {
    *
    * @param escrowId - ID of the escrow to query
    * @returns EscrowStatus with amounts, participants, and current state
+   * @throws CircuitOpenError when the TrustlessWork breaker is OPEN
    * @throws EscrowError on non-2xx API responses
    */
   async getEscrowStatus(escrowId: string): Promise<EscrowStatus> {
@@ -161,6 +207,7 @@ export class TrustlessWorkClient {
    *
    * @param params - Booking-specific parameters
    * @returns CreateEscrowResponse containing escrowId, contractId, and status
+   * @throws CircuitOpenError when the TrustlessWork breaker is OPEN
    * @throws EscrowError on non-2xx API responses
    */
   async createBookingEscrow(params: BookingEscrowParams): Promise<CreateEscrowResponse> {
@@ -250,3 +297,6 @@ export const trustlessWorkClient = new TrustlessWorkClient(
   process.env.TRUSTLESS_WORK_API_URL ?? 'https://api.trustlesswork.com',
   process.env.TRUSTLESS_WORK_API_KEY ?? '',
 );
+
+// Re-export for callers that need to check the circuit state directly
+export { CircuitOpenError };

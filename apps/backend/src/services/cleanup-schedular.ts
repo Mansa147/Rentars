@@ -22,12 +22,21 @@ import { purgeExpired as purgeExpiredIdempotencyKeys } from './idempotency.servi
 import { BookingService } from './booking.service.js';
 import { requeueFailedEvents, getInboxStats } from './ledgerEventInbox.service.js';
 import { computeLag } from './syncCursor.service.js';
+import { drainPendingOps, getPendingOpsStats } from './blockchainDegradedMode.service.js';
+import type { PendingOp } from './blockchainDegradedMode.service.js';
+import {
+  isSorobanDegraded,
+  isTrustlessWorkDegraded,
+} from './chainCircuitBreaker.service.js';
 import {
   incCounter,
   syncLagLedgers,
   syncDeadLetterDepth,
   syncRequeueTotal,
   syncInboxStatusTotal,
+  blockchainPendingOpsDepth,
+  blockchainOpsDrainedTotal,
+  blockchainOpsFailedTotal,
 } from '@/middleware/metrics.middleware.js';
 
 // ─── Import runDataRetention lazily to avoid circular dependency ──────────────
@@ -54,6 +63,7 @@ const SYNC_INTERVAL_MS                = 60 * 60 * 1000;       // 1 hour
 const RECONCILIATION_INTERVAL_MS      =  5 * 60 * 1000;       // 5 minutes
 const DLQ_RETRY_INTERVAL_MS           = 10 * 60 * 1000;       // 10 minutes
 const METRICS_REFRESH_INTERVAL_MS     =  2 * 60 * 1000;       // 2 minutes
+const PENDING_OPS_DRAIN_INTERVAL_MS   =  2 * 60 * 1000;       // 2 minutes
 const IDEMPOTENCY_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;       // 1 hour
 const BOOKING_EXPIRY_INTERVAL_MS      = 10 * 60 * 1000;       // 10 minutes
 
@@ -165,6 +175,97 @@ async function runDlqRetry(): Promise<void> {
   }
 }
 
+// ─── Pending ops drain (recovery after outage) ───────────────────────────────
+
+/**
+ * Build the executor function that the drain loop uses to re-run queued
+ * on-chain operations.  Imported lazily to avoid circular imports at
+ * module load time.
+ */
+async function buildOpExecutor(): Promise<((op: PendingOp) => Promise<void>) | null> {
+  try {
+    const [{ cancelBookingOnChain, createBookingOnChain, updateBookingStatusOnChain }, { trustlessWorkClient }] =
+      await Promise.all([
+        import('@/blockchain/bookingContract.js'),
+        import('@/blockchain/trustlessWork.js'),
+      ]);
+
+    return async (op: PendingOp): Promise<void> => {
+      const p = op.payload as Record<string, string>;
+
+      switch (op.op_type) {
+        case 'create_booking_on_chain':
+          await createBookingOnChain(
+            BigInt(p.on_chain_property_id),
+            p.buyer_stellar_address,
+            BigInt(p.check_in_ts),
+            BigInt(p.check_out_ts),
+            BigInt(p.total_price_stroops),
+          );
+          break;
+
+        case 'cancel_booking_on_chain':
+          await cancelBookingOnChain(BigInt(p.on_chain_id), p.caller_address);
+          break;
+
+        case 'update_booking_status_on_chain':
+          await updateBookingStatusOnChain(
+            BigInt(p.on_chain_id),
+            p.new_status as import('@/blockchain/types.js').BookingStatus,
+            p.caller_address,
+          );
+          break;
+
+        case 'release_escrow':
+          await trustlessWorkClient.releaseEscrow(p.escrow_id, p.reason);
+          break;
+
+        case 'cancel_escrow':
+          await trustlessWorkClient.cancelEscrow(p.escrow_id);
+          break;
+
+        default:
+          throw new Error(`Unknown op_type: ${(op as PendingOp).op_type}`);
+      }
+    };
+  } catch (err) {
+    console.error('[drain] Failed to build op executor:', err);
+    return null;
+  }
+}
+
+/**
+ * Drain the blockchain pending-ops queue.
+ * Only runs when neither circuit breaker is OPEN — if either is still open,
+ * we skip to avoid re-queuing the same failures immediately.
+ */
+async function runPendingOpsDrain(): Promise<void> {
+  if (isSorobanDegraded() || isTrustlessWorkDegraded()) {
+    // At least one dependency is still degraded — wait for next cycle.
+    return;
+  }
+
+  const executor = await buildOpExecutor();
+  if (!executor) return;
+
+  try {
+    const result = await drainPendingOps(executor, 10);
+    if (!result.success) {
+      console.error(`[drain] Drain failed: ${result.error}`);
+      return;
+    }
+
+    const { drained, failed } = result.data!;
+    if (drained > 0 || failed > 0) {
+      console.log(`[drain] Drained ${drained} op(s), ${failed} failed`);
+      if (drained > 0) incCounter(blockchainOpsDrainedTotal, {}, drained);
+      if (failed > 0) incCounter(blockchainOpsFailedTotal, {}, failed);
+    }
+  } catch (err) {
+    console.error('[drain] Scheduler error:', err);
+  }
+}
+
 // ─── Sync lag + inbox metrics refresh ────────────────────────────────────────
 
 /**
@@ -222,6 +323,19 @@ async function runMetricsRefresh(): Promise<void> {
     } else {
       console.error(`[metrics] Inbox stats refresh failed: ${inboxResult.error}`);
     }
+
+    // ── Pending ops queue depth ────────────────────────────────────────────
+    const pendingOpsResult = await getPendingOpsStats();
+    if (pendingOpsResult.success) {
+      const { queued, failed: opsFailed } = pendingOpsResult.data!;
+      const total = queued + opsFailed;
+      if (total > 0) {
+        incCounter(blockchainPendingOpsDepth, {}, total);
+        console.warn(
+          `[drain] Pending on-chain ops: ${queued} queued, ${opsFailed} failed`,
+        );
+      }
+    }
   } catch (err) {
     console.error('[metrics] Refresh error:', err);
   }
@@ -278,6 +392,11 @@ export function startSyncScheduler(): void {
     runDlqRetry().catch((err) => console.error('[dlq] Scheduler error:', err));
   }, DLQ_RETRY_INTERVAL_MS);
 
+  // ── Blockchain pending-ops drain (recovery after outage) ──────────────────
+  setInterval(() => {
+    runPendingOpsDrain().catch((err) => console.error('[drain] Scheduler error:', err));
+  }, PENDING_OPS_DRAIN_INTERVAL_MS);
+
   // ── Sync lag + inbox metrics ──────────────────────────────────────────────
   setInterval(() => {
     runMetricsRefresh().catch((err) => console.error('[metrics] Scheduler error:', err));
@@ -316,6 +435,10 @@ export function startSyncScheduler(): void {
     runMetricsRefresh().catch((err) =>
       console.error('[metrics] Initial refresh error:', err),
     );
+    // Attempt an initial drain in case ops were queued before the last restart.
+    runPendingOpsDrain().catch((err) =>
+      console.error('[drain] Initial drain error:', err),
+    );
   }, 30_000); // 30 s after startup
 
   // Startup dry-run preview of retention — lets operators see what the next
@@ -340,6 +463,7 @@ export function startSyncScheduler(): void {
     `sync: ${SYNC_INTERVAL_MS / 1000}s, ` +
     `reconcile: ${RECONCILIATION_INTERVAL_MS / 1000}s, ` +
     `dlq-retry: ${DLQ_RETRY_INTERVAL_MS / 1000}s, ` +
+    `pending-ops-drain: ${PENDING_OPS_DRAIN_INTERVAL_MS / 1000}s, ` +
     `metrics: ${METRICS_REFRESH_INTERVAL_MS / 1000}s, ` +
     `idempotency-cleanup: ${IDEMPOTENCY_CLEANUP_INTERVAL_MS / 1000}s, ` +
     `expiry: ${BOOKING_EXPIRY_INTERVAL_MS / 1000}s`,
